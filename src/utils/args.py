@@ -22,6 +22,8 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 50000000
     """total timesteps of the experiments"""
+    num_learners: int = 1
+    """the number of parallel learners"""
     
     # Data
     num_envs: int = 256

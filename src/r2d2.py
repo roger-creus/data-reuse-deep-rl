@@ -62,11 +62,13 @@ if __name__ == "__main__":
     target_network = QNetwork(envs, lstm_hidden_size=args.lstm_hidden_size).to(device)
     target_network.load_state_dict(q_network.state_dict())
     
+    # Training function
     def update(data):
         B, T, C, H, W = data["observations"].shape
         x = data["observations"] / 255.0
         rtrn_extras = {"indices" : data["indices"]}
         
+        # utility to unroll the online and target networks over a rollout
         def forward_pass(network, x, t, lstm_state, from_pixels=False):
             features = network.cnn(x[:, t].reshape(-1, C, H, W))
             features = network.mlp(features).reshape(B, -1)
@@ -79,6 +81,7 @@ if __name__ == "__main__":
         online_q_values = []
         target_q_values = []
         for t in range(T):
+            # init lstm state from the buffer
             if t == 0:
                 lstm_state = (
                     data["lstm_states_cell"][:, t].unsqueeze(0), # 1, B, lstm_hidden_size
@@ -89,11 +92,11 @@ if __name__ == "__main__":
                     data["lstm_states_hidden"][:, t].unsqueeze(0), # 1, B, lstm_hidden_size
                 )
                 
-            # target net never uses gradients
+            # unroll target network without gradients
             with torch.no_grad():
                 target_hidden, target_lstm_state = forward_pass(target_network, x, t, target_lstm_state, from_pixels=False)
                 
-            # if during burn-in, online network doesnt use gradients
+            # unroll online network - during burn-in, online network doesnt use gradients
             if t < args.burn_in_lstm_length:
                 with torch.no_grad():
                     new_hidden, lstm_state = forward_pass(q_network, x, t, lstm_state, from_pixels=False)
@@ -110,32 +113,25 @@ if __name__ == "__main__":
                 _target_q_values = target_network.q_func(target_hidden)
                 _target_q_values_max = _target_q_values.gather(1, _online_q_values_max_actions.unsqueeze(-1)).squeeze(-1)
             
-            # not double q-learning
-            #_target_q_values_max = target_network.q_func(target_hidden).max(dim=1).values
-            
             # store q-values
             online_q_values.append(_online_q_values)
             target_q_values.append(_target_q_values_max)
             
-        # at this point we only have data for the last T - burn_in_lstm_length steps
+        # at this point we only have training data for the last T - burn_in_lstm_length steps
         actions = data["actions"][:, args.burn_in_lstm_length:].long().unsqueeze(-1)
         rewards = data["rewards"][:, args.burn_in_lstm_length:]
         dones = data["dones"][:, args.burn_in_lstm_length:]
-                
         online_q_values = torch.stack(online_q_values, dim=1) # B, T, num_actions
+        online_q_values = online_q_values.gather(2, actions).squeeze(-1)
         target_q_values = torch.stack(target_q_values, dim=1) # B, T, num_actions
         
-        # get q-values for actions taken
-        online_q_values = online_q_values.gather(2, actions).squeeze(-1)
-        
-        # compute q_lambda returns
+        # compute q_lambda returns withoiut gradients
         with torch.no_grad():
             updte_steps = T - args.burn_in_lstm_length
             returns = torch.zeros(B, updte_steps, device=device)
             for t in reversed(range(updte_steps)):
                 if t == updte_steps - 1:
                     # last step -- bootstrap q-values from out-of-bounds observation and done of the rollout (was also stored in the buffer!)
-                    # this target_lstm_state could be also the last one from the sampled rollout (from the buffer) instead of the last one of the unrolled rollout 
                     target_hidden, _ = target_network.get_states(
                         data["last_observation"], target_lstm_state, data["last_done"]
                     )
@@ -150,6 +146,7 @@ if __name__ == "__main__":
 
         # compute loss
         loss = (online_q_values - returns).pow(2).sum(dim=1)
+        # importance sampling weights if using PER
         if args.use_per:
             loss = loss * data["importance_weights"]
         loss = loss.mean()
@@ -159,14 +156,13 @@ if __name__ == "__main__":
         optimizer.step()
         rtrn_extras["q_values"] = online_q_values.detach().mean()
         
+        # update priorities if using PER
         if args.use_per:
-            # compute new priorities
             max_absolute_td_error = (online_q_values.detach() - returns).abs().max(dim=1).values
             mean_absolute_td_error = (online_q_values.detach() - returns).abs().mean(dim=1)
             priorities = args.per_eta * max_absolute_td_error + (1 - args.per_eta) * mean_absolute_td_error
             priorities = priorities.cpu().numpy()
             rtrn_extras["priorities"] = priorities
-        
         return loss.detach(), rtrn_extras
 
     # replay buffer
