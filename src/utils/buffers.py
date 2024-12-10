@@ -12,7 +12,7 @@ from utils.segment_tree import SumSegmentTree, MinSegmentTree
 class PrioritizedRolloutBuffer:
     def __init__(
         self,
-        num_rollouts: int,
+        buffer_size: int,
         rollout_length: int,
         lstm_hidden_size: int,
         observation_space,
@@ -22,7 +22,7 @@ class PrioritizedRolloutBuffer:
         alpha: float = 0.6,  # Priority exponent
         beta: float = 0.4,   # Importance sampling exponent
     ):
-        self.num_rollouts = num_rollouts
+        self.buffer_size = buffer_size
         self.rollout_length = rollout_length
         self.lstm_hidden_size = lstm_hidden_size
         self.observation_space = observation_space
@@ -39,7 +39,7 @@ class PrioritizedRolloutBuffer:
 
         # Initialize segment trees
         tree_capacity = 1
-        while tree_capacity < self.num_rollouts:
+        while tree_capacity < self.buffer_size:
             tree_capacity *= 2
         
         self.sum_tree = SumSegmentTree(tree_capacity)
@@ -49,15 +49,15 @@ class PrioritizedRolloutBuffer:
         self.data_ready_event = threading.Event()
 
     def reset(self) -> None:
-        self.observations = torch.zeros((self.num_rollouts, self.rollout_length, *self.obs_shape), dtype=torch.uint8, device='cpu').share_memory_()
-        self.actions = torch.zeros((self.num_rollouts, self.rollout_length), dtype=torch.uint8, device='cpu').share_memory_()
-        self.rewards = torch.zeros((self.num_rollouts, self.rollout_length), dtype=torch.float32, device='cpu').share_memory_()
-        self.dones = torch.zeros((self.num_rollouts, self.rollout_length), dtype=torch.uint8, device='cpu').share_memory_()
-        self.last_observation = torch.zeros((self.num_rollouts, *self.obs_shape), dtype=torch.uint8, device='cpu').share_memory_()
-        self.last_done = torch.zeros(self.num_rollouts, dtype=torch.uint8, device='cpu').share_memory_()
+        self.observations = torch.zeros((self.buffer_size, self.rollout_length, *self.obs_shape), dtype=torch.uint8, device='cpu')
+        self.actions = torch.zeros((self.buffer_size, self.rollout_length), dtype=torch.uint8, device='cpu')
+        self.rewards = torch.zeros((self.buffer_size, self.rollout_length), dtype=torch.float32, device='cpu')
+        self.dones = torch.zeros((self.buffer_size, self.rollout_length), dtype=torch.uint8, device='cpu')
+        self.last_observation = torch.zeros((self.buffer_size, *self.obs_shape), dtype=torch.uint8, device='cpu')
+        self.last_done = torch.zeros(self.buffer_size, dtype=torch.uint8, device='cpu')
         self.lstm_states = {
-            "hidden": torch.zeros((self.num_rollouts, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu').share_memory_(),
-            "cell": torch.zeros((self.num_rollouts, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu').share_memory_(),
+            "hidden": torch.zeros((self.buffer_size, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu'),
+            "cell": torch.zeros((self.buffer_size, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu'),
         }
         self.pos = 0
         self.full = False
@@ -73,9 +73,8 @@ class PrioritizedRolloutBuffer:
         lstm_states: Dict[str, torch.Tensor],
         priority: float = 1.0,
     ):
-        with self.lock:
-            start_idx = self.pos
-            end_idx = (self.pos + self.n_envs) % self.num_rollouts
+        start_idx = self.pos
+        end_idx = (self.pos + self.n_envs) % self.buffer_size
 
             obs = observations.transpose(0, 1).to('cpu')
             act = actions.transpose(0, 1).to('cpu')
@@ -84,66 +83,57 @@ class PrioritizedRolloutBuffer:
             lstm_sts_hidden = lstm_states["hidden"].transpose(0, 1).to('cpu')
             lstm_sts_cell = lstm_states["cell"].transpose(0, 1).to('cpu')
 
-            # Handle circular buffer logic
-            if end_idx > start_idx:
-                self.observations[start_idx:end_idx] = obs
-                self.actions[start_idx:end_idx] = act
-                self.rewards[start_idx:end_idx] = rew
-                self.dones[start_idx:end_idx] = don
-                self.last_observation[start_idx:end_idx] = last_observation
-                self.last_done[start_idx:end_idx] = last_done
-                self.lstm_states["hidden"][start_idx:end_idx] = lstm_sts_hidden
-                self.lstm_states["cell"][start_idx:end_idx] = lstm_sts_cell
-            else:
-                split_point = self.num_rollouts - start_idx
-                self.observations[start_idx:] = obs[:split_point]
-                self.observations[:end_idx] = obs[split_point:]
-                self.actions[start_idx:] = act[:split_point]
-                self.actions[:end_idx] = act[split_point:]
-                self.rewards[start_idx:] = rew[:split_point]
-                self.rewards[:end_idx] = rew[split_point:]
-                self.dones[start_idx:] = don[:split_point]
-                self.dones[:end_idx] = don[split_point:]
-                self.last_observation[start_idx:] = last_observation[:split_point]
-                self.last_observation[:end_idx] = last_observation[split_point:]
-                self.last_done[start_idx:] = last_done[:split_point]
-                self.last_done[:end_idx] = last_done[split_point:]
-                self.lstm_states["hidden"][start_idx:] = lstm_sts_hidden[:split_point]
-                self.lstm_states["hidden"][:end_idx] = lstm_sts_hidden[split_point:]
-                self.lstm_states["cell"][start_idx:] = lstm_sts_cell[:split_point]
-                self.lstm_states["cell"][:end_idx] = lstm_sts_cell[split_point:]
+        # Handle circular buffer logic
+        if end_idx > start_idx:
+            self.observations[start_idx:end_idx] = obs
+            self.actions[start_idx:end_idx] = act
+            self.rewards[start_idx:end_idx] = rew
+            self.dones[start_idx:end_idx] = don
+            self.last_observation[start_idx:end_idx] = last_observation
+            self.last_done[start_idx:end_idx] = last_done
+            self.lstm_states["hidden"][start_idx:end_idx] = lstm_sts_hidden
+            self.lstm_states["cell"][start_idx:end_idx] = lstm_sts_cell
+        else:
+            split_point = self.buffer_size - start_idx
+            self.observations[start_idx:] = obs[:split_point]
+            self.observations[:end_idx] = obs[split_point:]
+            self.actions[start_idx:] = act[:split_point]
+            self.actions[:end_idx] = act[split_point:]
+            self.rewards[start_idx:] = rew[:split_point]
+            self.rewards[:end_idx] = rew[split_point:]
+            self.dones[start_idx:] = don[:split_point]
+            self.dones[:end_idx] = don[split_point:]
+            self.last_observation[start_idx:] = last_observation[:split_point]
+            self.last_observation[:end_idx] = last_observation[split_point:]
+            self.last_done[start_idx:] = last_done[:split_point]
+            self.last_done[:end_idx] = last_done[split_point:]
+            self.lstm_states["hidden"][start_idx:] = lstm_sts_hidden[:split_point]
+            self.lstm_states["hidden"][:end_idx] = lstm_sts_hidden[split_point:]
+            self.lstm_states["cell"][start_idx:] = lstm_sts_cell[:split_point]
+            self.lstm_states["cell"][:end_idx] = lstm_sts_cell[split_point:]
 
-            # Update priorities in segment trees
-            for i in range(self.n_envs):
-                idx = (start_idx + i) % self.num_rollouts
-                priority_val = priority ** self.alpha
-                self.sum_tree[idx] = priority_val
-                self.min_tree[idx] = priority_val
-            
-            self.max_priority = max(self.max_priority, priority)
-            self.pos = end_idx
-            self.full = self.full or end_idx < start_idx
-            
-            self.data_ready_event.set()
+        # Update priorities in segment trees
+        for i in range(self.n_envs):
+            idx = (start_idx + i) % self.buffer_size
+            priority_val = priority ** self.alpha
+            self.sum_tree[idx] = priority_val
+            self.min_tree[idx] = priority_val
+        
+        self.max_priority = max(self.max_priority, priority)
+        self.pos = end_idx
+        self.full = self.full or end_idx < start_idx
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
-        while not self.data_ready_event.is_set():
-            print("Waiting for data to be ready")
-            self.data_ready_event.wait()
-            
-        print("Data is ready")
-        
-        with self.lock:
-            upper_bound = self.num_rollouts if self.full else self.pos
-            indices = self._sample_proportional(batch_size, upper_bound)
+        upper_bound = self.buffer_size if self.full else self.pos
+        indices = self._sample_proportional(batch_size, upper_bound)
 
-            # Calculate importance weights
-            importance_weights = torch.tensor([
-                self._calculate_weight(idx, self.beta, upper_bound) for idx in indices
-            ], dtype=torch.float32, device=self.device)
-            importance_weights /= importance_weights.max()
+        # Calculate importance weights
+        importance_weights = torch.tensor([
+            self._calculate_weight(idx, self.beta, upper_bound) for idx in indices
+        ], dtype=torch.float32, device=self.device)
+        importance_weights /= importance_weights.max()
 
-            return self._get_samples(indices, importance_weights)
+        return self._get_samples(indices, importance_weights)
 
     def _sample_proportional(self, batch_size: int, upper_bound: int):
         indices = []
@@ -195,7 +185,7 @@ class PrioritizedRolloutBuffer:
 class RolloutBuffer:
     def __init__(
         self,
-        num_rollouts: int,
+        buffer_size: int,
         rollout_length: int,
         lstm_hidden_size: int,
         observation_space,
@@ -203,7 +193,7 @@ class RolloutBuffer:
         device="auto",
         n_envs: int = 1,
     ):
-        self.num_rollouts = num_rollouts
+        self.buffer_size = buffer_size
         self.rollout_length = rollout_length
         self.lstm_hidden_size = lstm_hidden_size
         self.observation_space = observation_space
@@ -217,16 +207,17 @@ class RolloutBuffer:
         self.reset()
 
     def reset(self) -> None:
-        self.observations = torch.zeros((self.num_rollouts, self.rollout_length, *self.obs_shape), dtype=torch.uint8, device='cpu')
-        self.actions = torch.zeros((self.num_rollouts, self.rollout_length), dtype=torch.uint8, device='cpu')
-        self.rewards = torch.zeros((self.num_rollouts, self.rollout_length), dtype=torch.float32, device='cpu')
-        self.dones = torch.zeros((self.num_rollouts, self.rollout_length), dtype=torch.uint8, device='cpu')
-        self.last_observation = torch.zeros((self.num_rollouts, *self.obs_shape), dtype=torch.uint8, device='cpu')
-        self.last_done = torch.zeros(self.num_rollouts, dtype=torch.uint8, device='cpu')
-        self.lstm_states = {
-            "hidden": torch.zeros((self.num_rollouts, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu'),
-            "cell": torch.zeros((self.num_rollouts, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu'),
-        }
+        self.observations = torch.zeros((self.buffer_size, self.rollout_length, *self.obs_shape), dtype=torch.uint8, device='cpu')
+        self.actions = torch.zeros((self.buffer_size, self.rollout_length), dtype=torch.uint8, device='cpu')
+        self.rewards = torch.zeros((self.buffer_size, self.rollout_length), dtype=torch.float32, device='cpu')
+        self.dones = torch.zeros((self.buffer_size, self.rollout_length), dtype=torch.uint8, device='cpu')
+        self.last_observation = torch.zeros((self.buffer_size, *self.obs_shape), dtype=torch.uint8, device='cpu')
+        self.last_done = torch.zeros(self.buffer_size, dtype=torch.uint8, device='cpu')
+        if self.lstm_hidden_size > 0:
+            self.lstm_states = {
+                "hidden": torch.zeros((self.buffer_size, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu'),
+                "cell": torch.zeros((self.buffer_size, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu'),
+            }
         self.pos = 0
         self.full = False
 
@@ -238,17 +229,19 @@ class RolloutBuffer:
         dones: torch.Tensor,
         last_observation: torch.Tensor,
         last_done: torch.Tensor,
-        lstm_states: Dict[str, torch.Tensor],
+        lstm_states: Dict[str, torch.Tensor] = None,
     ):
         start_idx = self.pos
-        end_idx = (self.pos + self.n_envs) % self.num_rollouts
+        end_idx = (self.pos + self.n_envs) % self.buffer_size
 
         obs = observations.transpose(0, 1).to('cpu')
         act = actions.transpose(0, 1).to('cpu')
         rew = rewards.transpose(0, 1).to('cpu')
         don = dones.transpose(0, 1).to('cpu')
-        lstm_sts_hidden = lstm_states["hidden"].transpose(0, 1).to('cpu')
-        lstm_sts_cell = lstm_states["cell"].transpose(0, 1).to('cpu')
+
+        if lstm_states is not None:
+            lstm_sts_hidden = lstm_states["hidden"].transpose(0, 1).to('cpu')
+            lstm_sts_cell = lstm_states["cell"].transpose(0, 1).to('cpu')
 
         # Handle circular buffer logic
         if end_idx > start_idx:
@@ -258,10 +251,11 @@ class RolloutBuffer:
             self.dones[start_idx:end_idx] = don
             self.last_observation[start_idx:end_idx] = last_observation
             self.last_done[start_idx:end_idx] = last_done
-            self.lstm_states["hidden"][start_idx:end_idx] = lstm_sts_hidden
-            self.lstm_states["cell"][start_idx:end_idx] = lstm_sts_cell
+            if self.lstm_hidden_size > 0:
+                self.lstm_states["hidden"][start_idx:end_idx] = lstm_sts_hidden
+                self.lstm_states["cell"][start_idx:end_idx] = lstm_sts_cell
         else:
-            split_point = self.num_rollouts - start_idx
+            split_point = self.buffer_size - start_idx
             self.observations[start_idx:] = obs[:split_point]
             self.observations[:end_idx] = obs[split_point:]
             self.actions[start_idx:] = act[:split_point]
@@ -274,16 +268,18 @@ class RolloutBuffer:
             self.last_observation[:end_idx] = last_observation[split_point:]
             self.last_done[start_idx:] = last_done[:split_point]
             self.last_done[:end_idx] = last_done[split_point:]
-            self.lstm_states["hidden"][start_idx:] = lstm_sts_hidden[:split_point]
-            self.lstm_states["hidden"][:end_idx] = lstm_sts_hidden[split_point:]
-            self.lstm_states["cell"][start_idx:] = lstm_sts_cell[:split_point]
-            self.lstm_states["cell"][:end_idx] = lstm_sts_cell[split_point:]
+            
+            if self.lstm_hidden_size > 0:
+                self.lstm_states["hidden"][start_idx:] = lstm_sts_hidden[:split_point]
+                self.lstm_states["hidden"][:end_idx] = lstm_sts_hidden[split_point:]
+                self.lstm_states["cell"][start_idx:] = lstm_sts_cell[:split_point]
+                self.lstm_states["cell"][:end_idx] = lstm_sts_cell[split_point:]
 
         self.pos = end_idx
         self.full = self.full or end_idx < start_idx
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
-        upper_bound = self.num_rollouts if self.full else self.pos
+        upper_bound = self.buffer_size if self.full else self.pos
         indices = random.sample(range(upper_bound), batch_size)
         return self._get_samples(indices)
 
@@ -295,10 +291,13 @@ class RolloutBuffer:
             "dones": self.dones[indices],
             "last_observation": self.last_observation[indices],
             "last_done": self.last_done[indices],
-            "lstm_states_hidden": self.lstm_states["hidden"][indices],
-            "lstm_states_cell": self.lstm_states["cell"][indices],
             "indices": indices,
         }
+        
+        if self.lstm_hidden_size > 0:
+            data["lstm_states_hidden"] = self.lstm_states["hidden"][indices]
+            data["lstm_states_cell"] = self.lstm_states["cell"][indices]
+            
         data = {k: v.to(self.device) for k, v in data.items() if k != "indices"}
         data["indices"] = indices
         return data
@@ -329,56 +328,55 @@ class SingleRolloutBuffer:
         self.init_buffers()
         
     def init_buffers(self) -> None:
-        print("Initializing buffers")
-        with self.lock:
-            self.observations = torch.zeros(
-                (self.rollout_length, self.n_envs, *self.obs_shape),
-                dtype=torch.uint8,
-                device="cpu"
-            ).share_memory_()
-            self.actions = torch.zeros(
-                (self.rollout_length, self.n_envs),
-                dtype=torch.uint8,
-                device="cpu"
-            ).share_memory_()
-            self.rewards = torch.zeros(
-                (self.rollout_length, self.n_envs),
-                dtype=torch.float32,
-                device="cpu"
-            ).share_memory_()
-            self.dones = torch.zeros(
-                (self.rollout_length, self.n_envs),
-                dtype=torch.uint8,
-                device="cpu"
-            ).share_memory_()
-            
+        self.observations = torch.zeros(
+            (self.rollout_length, self.n_envs, *self.obs_shape),
+            dtype=torch.uint8,
+            device="cpu"
+        )
+        self.actions = torch.zeros(
+            (self.rollout_length, self.n_envs),
+            dtype=torch.uint8,
+            device="cpu"
+        )
+        self.rewards = torch.zeros(
+            (self.rollout_length, self.n_envs),
+            dtype=torch.float32,
+            device="cpu"
+        )
+        self.dones = torch.zeros(
+            (self.rollout_length, self.n_envs),
+            dtype=torch.uint8,
+            device="cpu"
+        )
+        
+        if self.lstm_hidden_size > 0:
             self.lstm_states = {
                 "hidden": torch.zeros(
                     (self.rollout_length, self.n_envs, self.lstm_hidden_size),
                     dtype=torch.float32,
                     device="cpu"
-                ).share_memory_(),
+                ),
                 "cell": torch.zeros(
                     (self.rollout_length, self.n_envs, self.lstm_hidden_size),
                     dtype=torch.float32,
                     device="cpu"
-                ).share_memory_(),
+                ),
             }
-            
-            self.pos = 0
-            self.full = False
-            print("Buffers initialized")
+        self.pos = 0
+        self.full = False
 
     def reset_half(self) -> None:
-        with self.lock:
-            self.observations[:self.rollout_length // 2] = self.observations[self.rollout_length // 2:]
-            self.actions[:self.rollout_length // 2] = self.actions[self.rollout_length // 2:]
-            self.rewards[:self.rollout_length // 2] = self.rewards[self.rollout_length // 2:]
-            self.dones[:self.rollout_length // 2] = self.dones[self.rollout_length // 2:]
+        self.observations[:self.rollout_length // 2] = self.observations[self.rollout_length // 2:]
+        self.actions[:self.rollout_length // 2] = self.actions[self.rollout_length // 2:]
+        self.rewards[:self.rollout_length // 2] = self.rewards[self.rollout_length // 2:]
+        self.dones[:self.rollout_length // 2] = self.dones[self.rollout_length // 2:]
+        
+        if self.lstm_hidden_size > 0:
             self.lstm_states["hidden"][:self.rollout_length // 2] = self.lstm_states["hidden"][self.rollout_length // 2:]
             self.lstm_states["cell"][:self.rollout_length // 2] = self.lstm_states["cell"][self.rollout_length // 2:]
-            self.pos = self.rollout_length // 2
-            self.full = False
+            
+        self.pos = self.rollout_length // 2
+        self.full = False
 
     def add(
         self,
@@ -386,15 +384,17 @@ class SingleRolloutBuffer:
         actions: np.ndarray,
         rewards: np.ndarray,
         dones: np.ndarray,
-        lstm_states: Dict[str, torch.Tensor],
+        lstm_states: Dict[str, torch.Tensor] = None,
     ):
-        with self.lock:
-            self.observations[self.pos] = torch.from_numpy(observations).to("cpu", dtype=torch.uint8)
-            self.actions[self.pos] = torch.from_numpy(actions).to("cpu", dtype=torch.uint8)
-            self.rewards[self.pos] = torch.from_numpy(rewards).to("cpu", dtype=torch.float32)
-            self.dones[self.pos] = torch.from_numpy(dones).to("cpu", dtype=torch.uint8)
+        self.observations[self.pos] = torch.from_numpy(observations).to("cpu", dtype=torch.uint8)
+        self.actions[self.pos] = torch.from_numpy(actions).to("cpu", dtype=torch.uint8)
+        self.rewards[self.pos] = torch.from_numpy(rewards).to("cpu", dtype=torch.float32)
+        self.dones[self.pos] = torch.from_numpy(dones).to("cpu", dtype=torch.uint8)
+        
+        if self.lstm_hidden_size > 0:
             self.lstm_states["hidden"][self.pos] = lstm_states[0].clone().cpu()
             self.lstm_states["cell"][self.pos] = lstm_states[1].clone().cpu()
-            self.pos += 1
-            if self.pos == self.rollout_length:
-                self.full = True
+        
+        self.pos += 1
+        if self.pos == self.rollout_length:
+            self.full = True

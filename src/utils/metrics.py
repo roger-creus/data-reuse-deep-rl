@@ -1,7 +1,12 @@
 import torch
 import torch.nn.functional as F
 
+@torch.no_grad()
 def compute_training_metrics(agent, old_agent, obs):
+    obs_shape = obs.shape
+    if len(obs_shape) == 5:
+        obs = obs.view(-1, *obs_shape[-3:])
+    
     # phi_t(x)
     old_hidden, _ = old_agent.get_representation(obs)
     # psi_t(phi_t(x))
