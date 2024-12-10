@@ -21,6 +21,7 @@ class PrioritizedRolloutBuffer:
         n_envs: int = 1,
         alpha: float = 0.6,  # Priority exponent
         beta: float = 0.4,   # Importance sampling exponent
+        async_: bool = False,
     ):
         self.buffer_size = buffer_size
         self.rollout_length = rollout_length
@@ -33,6 +34,7 @@ class PrioritizedRolloutBuffer:
         self.device = device
         self.alpha = alpha
         self.beta = beta
+        self.async_ = async_
 
         # Initialize data buffers
         self.reset()
@@ -45,9 +47,11 @@ class PrioritizedRolloutBuffer:
         self.sum_tree = SumSegmentTree(tree_capacity)
         self.min_tree = MinSegmentTree(tree_capacity)
         self.max_priority = 1.0
-        self.lock = threading.Lock()
-        self.data_ready_event = threading.Event()
-
+        
+        if self.async_:
+            self.lock = mp.Lock()
+            self.data_ready_event = mp.Event()
+            
     def reset(self) -> None:
         self.observations = torch.zeros((self.buffer_size, self.rollout_length, *self.obs_shape), dtype=torch.uint8, device='cpu')
         self.actions = torch.zeros((self.buffer_size, self.rollout_length), dtype=torch.uint8, device='cpu')
@@ -59,6 +63,18 @@ class PrioritizedRolloutBuffer:
             "hidden": torch.zeros((self.buffer_size, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu'),
             "cell": torch.zeros((self.buffer_size, self.rollout_length, self.lstm_hidden_size), dtype=torch.float32, device='cpu'),
         }
+        
+        # put in shared memory if async
+        if self.async_:
+            self.observations.share_memory_()
+            self.actions.share_memory_()
+            self.rewards.share_memory_()
+            self.dones.share_memory_()
+            self.last_observation.share_memory_()
+            self.last_done.share_memory_()
+            self.lstm_states["hidden"].share_memory_()
+            self.lstm_states["cell"].share_memory_()
+        
         self.pos = 0
         self.full = False
 
@@ -73,15 +89,40 @@ class PrioritizedRolloutBuffer:
         lstm_states: Dict[str, torch.Tensor],
         priority: float = 1.0,
     ):
+        
+        if self.async_:
+            self.lock.acquire()
+            self._add(
+                observations, actions, rewards, dones, last_observation, last_done, lstm_states, priority
+            )
+            self.lock.release()
+            self.data_ready_event.set()
+            
+        else:
+            self._add(
+                observations, actions, rewards, dones, last_observation, last_done, lstm_states, priority
+            )
+            
+    def _add(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        last_observation: torch.Tensor,
+        last_done: torch.Tensor,
+        lstm_states: Dict[str, torch.Tensor],
+        priority: float,
+    ):
         start_idx = self.pos
         end_idx = (self.pos + self.n_envs) % self.buffer_size
 
-            obs = observations.transpose(0, 1).to('cpu')
-            act = actions.transpose(0, 1).to('cpu')
-            rew = rewards.transpose(0, 1).to('cpu')
-            don = dones.transpose(0, 1).to('cpu')
-            lstm_sts_hidden = lstm_states["hidden"].transpose(0, 1).to('cpu')
-            lstm_sts_cell = lstm_states["cell"].transpose(0, 1).to('cpu')
+        obs = observations.transpose(0, 1).to('cpu')
+        act = actions.transpose(0, 1).to('cpu')
+        rew = rewards.transpose(0, 1).to('cpu')
+        don = dones.transpose(0, 1).to('cpu')
+        lstm_sts_hidden = lstm_states["hidden"].transpose(0, 1).to('cpu')
+        lstm_sts_cell = lstm_states["cell"].transpose(0, 1).to('cpu')
 
         # Handle circular buffer logic
         if end_idx > start_idx:
@@ -124,6 +165,16 @@ class PrioritizedRolloutBuffer:
         self.full = self.full or end_idx < start_idx
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        if self.async_:
+            self.data_ready_event.wait()
+            self.lock.acquire()
+            data = self._sample(batch_size)
+            self.lock.release()
+            return data
+        else:
+            return self._sample(batch_size)
+        
+    def _sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         upper_bound = self.buffer_size if self.full else self.pos
         indices = self._sample_proportional(batch_size, upper_bound)
 
@@ -175,12 +226,34 @@ class PrioritizedRolloutBuffer:
         return data
         
     def update_priorities(self, indices: torch.Tensor, priorities: torch.Tensor):
-        with self.lock:
-            for idx, priority in zip(indices, priorities):
-                priority_val = priority ** self.alpha
-                self.sum_tree[idx] = priority_val
-                self.min_tree[idx] = priority_val
-                self.max_priority = max(self.max_priority, priority)
+        if self.async_:
+            self.lock.acquire()
+            self._update_priorities(indices, priorities)
+            self.lock.release()
+        else:
+            self._update_priorities(indices, priorities)
+            
+    def _update_priorities(self, indices: torch.Tensor, priorities: torch.Tensor):
+        for idx, priority in zip(indices, priorities):
+            priority_val = priority ** self.alpha
+            self.sum_tree[idx] = priority_val
+            self.min_tree[idx] = priority_val
+            self.max_priority = max(self.max_priority, priority)
+            
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Remove unpickleable attributes
+        if self.async_:
+            del state['lock']
+            del state['data_ready_event']
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Reinitialize unpickleable attributes
+        if self.async_:
+            self.lock = mp.Lock()
+            self.data_ready_event = mp.Event()
             
 class RolloutBuffer:
     def __init__(
@@ -279,6 +352,16 @@ class RolloutBuffer:
         self.full = self.full or end_idx < start_idx
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        if self.async_:
+            self.data_ready_event.wait()
+            self.lock.acquire()
+            data = self._sample(batch_size)
+            self.lock.release()
+            return data
+        else:
+            return self._sample(batch_size)
+        
+    def _sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         upper_bound = self.buffer_size if self.full else self.pos
         indices = random.sample(range(upper_bound), batch_size)
         return self._get_samples(indices)

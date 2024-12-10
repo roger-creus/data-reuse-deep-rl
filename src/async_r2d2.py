@@ -8,8 +8,8 @@ import torch.optim as optim
 import tyro
 import os
 import wandb
-from torch import multiprocessing as mp
 from collections import deque
+from torch import multiprocessing as mp
 
 from utils.buffers import RolloutBuffer, SingleRolloutBuffer, PrioritizedRolloutBuffer
 from utils.args import Args
@@ -18,13 +18,17 @@ from utils.utils import RecordEpisodeStatistics, linear_schedule
 from IPython import embed
 
 if __name__ == "__main__":
+    mp.set_start_method("fork", force=True)
     os.environ["WANDB__SERVICE_WAIT"] = "300"
     os.environ["OMP_NUM_THREADS"] = "1" 
     virtual_cpu_count = mp.cpu_count() - 1
 
     args = tyro.cli(Args)
-    if args.exp_name is None:
-        args.exp_name = os.path.basename(__file__)[: -len(".py")]
+    if args.exp_name == None:
+        args.exp_name = "r2d2"
+        
+    # adjust buffer size
+    args.buffer_size = args.buffer_size // args.rollout_length
         
     # logging
     run_name = f"{args.env_id}_{args.exp_name}_usePER:{args.use_per}_s{args.seed}_{int(time.time())}"
@@ -65,14 +69,23 @@ if __name__ == "__main__":
     rb_args = dict(alpha=args.per_alpha,beta=args.per_beta) if args.use_per else {}
     
     replay_buffer = rb_clss(
-        num_rollouts=args.num_rollouts,
+        buffer_size=args.buffer_size,
         rollout_length=args.rollout_length,
         lstm_hidden_size=args.lstm_hidden_size,
         observation_space=mock_envs.observation_space,
         action_space=mock_envs.action_space,
         device=device,
         n_envs=args.num_envs,
+        async_=True,
         **rb_args
+    )
+    
+    single_rollout_buffer = SingleRolloutBuffer(
+        rollout_length=args.rollout_length,
+        lstm_hidden_size=args.lstm_hidden_size,
+        n_envs=args.num_envs,
+        observation_space=mock_envs.observation_space,
+        action_space=mock_envs.action_space,
     )
     
     mock_envs.close()
@@ -195,7 +208,7 @@ if __name__ == "__main__":
                 #        )
 
     
-    def actor_process(actor_idx, replay_buffer):
+    def actor_process(actor_idx, q_network, replay_buffer, single_rollout_buffer):
         torch.set_num_threads(virtual_cpu_count - args.num_learners)
         print(f"Started actor process with {virtual_cpu_count - args.num_learners} threads")
         
@@ -217,14 +230,6 @@ if __name__ == "__main__":
         assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
         
         
-        single_rollout_buffer = SingleRolloutBuffer(
-            rollout_length=args.rollout_length,
-            lstm_hidden_size=args.lstm_hidden_size,
-            n_envs=args.num_envs,
-            observation_space=envs.observation_space,
-            action_space=envs.action_space,
-        )
-        
         # start
         start_time = time.time()
         global_step = 0
@@ -234,15 +239,17 @@ if __name__ == "__main__":
         
         # initial lstm states
         lstm_state = (
-            torch.zeros(q_network.lstm.num_layers, args.num_envs, q_network.lstm.hidden_size).to(device),
-            torch.zeros(q_network.lstm.num_layers, args.num_envs, q_network.lstm.hidden_size).to(device),
+          torch.zeros(q_network.lstm.num_layers, args.num_envs, q_network.lstm.hidden_size).to(device),
+          torch.zeros(q_network.lstm.num_layers, args.num_envs, q_network.lstm.hidden_size).to(device),
         )
-        
         
         # ACTORS LOOP
         while True:
             # increment global step
             global_step += envs.num_envs
+            
+            
+            print("1")
             
             # select actions
             epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
@@ -256,6 +263,7 @@ if __name__ == "__main__":
                 explore = torch.rand((args.num_envs,)).to(device) < epsilon
                 actions = torch.where(explore, random_actions, q_actions)
             
+            print("2")
             actions = actions.cpu().numpy() 
 
             # execute actions
@@ -271,6 +279,7 @@ if __name__ == "__main__":
             if len(_avg_ep_returns) > 0:
                 print(f"global_step={global_step}, avg_ep_return={np.mean(_avg_ep_returns)}")
 
+            print("3")
             # add data to single rollout buffer
             single_rollout_buffer.add(
                 observations=obs.astype(np.uint8),
@@ -279,6 +288,7 @@ if __name__ == "__main__":
                 dones=done.astype(np.uint8),
                 lstm_states=lstm_state,
             )
+            print("4")
 
             # crucial step easy to overlook
             obs = next_obs
@@ -299,7 +309,7 @@ if __name__ == "__main__":
                 single_rollout_buffer.reset_half()
             
     # ACTOR LOOP
-    actor_thread = mp.Process(target=actor_process, args=(0, replay_buffer))
+    actor_thread = mp.Process(target=actor_process, args=(0, q_network, replay_buffer, single_rollout_buffer))
     actor_thread.start()
 
     # LEARNER LOOP

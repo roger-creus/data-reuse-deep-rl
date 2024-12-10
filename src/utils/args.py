@@ -26,6 +26,8 @@ class Args:
     """if toggled, the nsteps will be used"""
     use_q_lambda: bool = False
     """if toggled, the Q(lambda) algorithm will be used"""
+    num_learners : int = 1
+    """the number of learners (only used in async)"""
     
     # Data
     num_envs: int = 256
