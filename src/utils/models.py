@@ -9,11 +9,12 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 class QNetwork(nn.Module):
-    def __init__(self, env, lstm_hidden_size=128):
+    def __init__(self, env, input_channels=4, lstm_hidden_size=128):
         super().__init__()
+        self.lstm_hidden_size = lstm_hidden_size
         
         self.cnn = nn.Sequential(
-            layer_init(nn.Conv2d(1, 32, 8, stride=4)),
+            layer_init(nn.Conv2d(input_channels, 32, 8, stride=4)),
             nn.ReLU(),
             layer_init(nn.Conv2d(32, 64, 4, stride=2)),
             nn.ReLU(),
@@ -27,22 +28,31 @@ class QNetwork(nn.Module):
             nn.ReLU()
         )
         
-        self.lstm = nn.LSTM(512, lstm_hidden_size)
-        for name, param in self.lstm.named_parameters():
-            if "bias" in name:
-                nn.init.constant_(param, 0)
-            elif "weight" in name:
-                nn.init.orthogonal_(param, 1.0)
-        
+        if lstm_hidden_size == -1:
+            lstm_hidden_size = 512
+        else:
+            self.lstm = nn.LSTM(512, lstm_hidden_size)
+            for name, param in self.lstm.named_parameters():
+                if "bias" in name:
+                    nn.init.constant_(param, 0)
+                elif "weight" in name:
+                    nn.init.orthogonal_(param, 1.0)
+                    
         self.q_func = nn.Sequential(
             nn.ReLU(),
             layer_init(nn.Linear(lstm_hidden_size, env.action_space.n)),
         )
 
-    def forward(self, x, lstm_state, done, from_pixels=True):
-        x, lstm_state = self.get_states(x, lstm_state, done, from_pixels)
-        x = self.q_func(x)
-        return x, lstm_state
+    def forward(self, x, lstm_state=None, done=None, from_pixels=True):
+        if self.lstm_hidden_size == -1:
+            x = x / 255.0
+            x = self.cnn(x)
+            x = self.mlp(x)
+            x = self.q_func(x)
+            return x
+        else:
+            x, lstm_state = self.get_states(x, lstm_state, done, from_pixels)
+            return x, lstm_state
     
     def get_states(self, x, lstm_state, done, from_pixels=True):
         if from_pixels:

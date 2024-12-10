@@ -6,6 +6,8 @@ import numpy as np
 import torch
 import torch.optim as optim
 import tyro
+import os
+import wandb
 from collections import deque
 
 from utils.buffers import RolloutBuffer, SingleRolloutBuffer, PrioritizedRolloutBuffer
@@ -15,8 +17,6 @@ from utils.utils import RecordEpisodeStatistics, linear_schedule
 from IPython import embed
 
 if __name__ == "__main__":
-    import os
-    import wandb
     os.environ["WANDB__SERVICE_WAIT"] = "300"
 
     args = tyro.cli(Args)
@@ -216,7 +216,6 @@ if __name__ == "__main__":
         
         # select actions
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
-        epsilon_tensor = torch.as_tensor(epsilon, device=device, dtype=torch.float)
         obs_tensor = torch.as_tensor(obs, device=device, dtype=torch.float)
         done_tensor = torch.as_tensor(done, device=device, dtype=torch.float)
 
